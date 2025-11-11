@@ -42,7 +42,7 @@ jobs:
 
   build-reproducible:
     name: build and push reproducible image and binaries
-    runs-on: ubuntu-latest
+    runs-on: warp-ubuntu-2404-x64-32x #TODO
     needs: [extract-version, wait-for-release]
     permissions:
       packages: write
@@ -112,7 +112,9 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           export GPG_TTY=$(tty)
-          echo -n "$GPG_SIGNING_KEY" | base64 --decode | gpg --batch --import
+          #echo -n "$GPG_SIGNING_KEY" | base64 --decode | gpg --batch --import
+          #TODO
+          echo -n "$GPG_SIGNING_KEY" | gpg --batch --import
 
           cd reproducible-artifacts
           tar -czf reth-reproducible-${{ needs.extract-version.outputs.VERSION }}-x86_64-unknown-linux-gnu.tar.gz reth-reproducible-${{ needs.extract-version.outputs.VERSION }}-x86_64-unknown-linux-gnu
