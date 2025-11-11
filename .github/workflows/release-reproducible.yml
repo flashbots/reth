@@ -3,9 +3,9 @@
 name: release-reproducible
 
 on:
-  push:
-    tags:
-      - v*
+  workflow_run:
+    workflows: [release]
+    types: [completed]
 
 env:
   DOCKER_REPRODUCIBLE_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/reth-reproducible
@@ -13,6 +13,7 @@ env:
 jobs:
   extract-version:
     name: extract version
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Extract version
