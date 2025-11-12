@@ -24,8 +24,7 @@ jobs:
           # Get the tag that points to the head SHA of the triggering workflow
           TAG=$(gh api /repos/${{ github.repository }}/git/refs/tags \
             --jq '.[] | select(.object.sha == "${{ github.event.workflow_run.head_sha }}") | .ref' \
-            | head -1 \
-            | sed 's|refs/tags/||')
+            | head -1)
 
           if [ -z "$TAG" ]; then
             echo "No tag found for SHA ${{ github.event.workflow_run.head_sha }}"
@@ -47,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.extract-version.outputs.VERSION }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
