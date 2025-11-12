@@ -24,7 +24,8 @@ jobs:
           # Get the tag that points to the head SHA of the triggering workflow
           TAG=$(gh api /repos/${{ github.repository }}/git/refs/tags \
             --jq '.[] | select(.object.sha == "${{ github.event.workflow_run.head_sha }}") | .ref' \
-            | head -1)
+            | head -1 \
+            | sed 's|refs/tags/||')
 
           if [ -z "$TAG" ]; then
             echo "No tag found for SHA ${{ github.event.workflow_run.head_sha }}"
@@ -32,7 +33,6 @@ jobs:
           fi
 
           echo "VERSION=$TAG" >> $GITHUB_OUTPUT
-          echo "Found tag: $TAG"
     outputs:
       VERSION: ${{ steps.extract_version.outputs.VERSION }}
 
