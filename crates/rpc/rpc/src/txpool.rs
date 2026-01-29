@@ -15,7 +15,7 @@ use reth_rpc_eth_api::RpcTransaction;
 use reth_transaction_pool::{
     AllPoolTransactions, PoolConsensusTx, PoolTransaction, TransactionPool,
 };
-use tracing::trace;
+use tracing::{info, trace};
 
 /// `txpool` API implementation.
 ///
@@ -144,7 +144,7 @@ where
     /// See [here](https://geth.ethereum.org/docs/rpc/ns-txpool#txpool_content) for more details
     /// Handler for `txpool_content`
     async fn txpool_content(&self) -> RpcResult<TxpoolContent<RpcTransaction<Eth::Network>>> {
-        trace!(target: "rpc::eth", "Serving txpool_content");
+        info!(target: "rpc::eth", "Serving txpool_content");
         Ok(self.content().map_err(Into::into)?)
     }
 }
