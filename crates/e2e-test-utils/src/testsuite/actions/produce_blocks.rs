@@ -6,7 +6,8 @@ use crate::testsuite::{
 };
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::{
-    payload::ExecutionPayloadEnvelopeV3, ForkchoiceState, PayloadAttributes, PayloadStatusEnum,
+    payload::ExecutionPayloadEnvelopeV3, CancunPayloadFields, ExecutionPayload,
+    ExecutionPayloadSidecar, ForkchoiceState, PayloadAttributes, PayloadStatusEnum,
 };
 use alloy_rpc_types_eth::{Block, Header, Receipt, Transaction, TransactionRequest};
 use eyre::Result;
@@ -1036,14 +1037,33 @@ pub struct ProduceInvalidBlocks<Engine> {
     pub num_blocks: u64,
     /// Set of indices (0-based) where blocks should be made invalid
     pub invalid_indices: HashSet<u64>,
+    /// How invalid blocks should be corrupted.
+    pub corruption: InvalidBlockCorruption,
     /// Tracks engine type
     _phantom: PhantomData<Engine>,
+}
+
+/// Invalid payload corruption mode.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum InvalidBlockCorruption {
+    /// Corrupt the state root without preserving block hash consistency.
+    #[default]
+    Generic,
+    /// Corrupt the state root and recompute the block hash, forcing state-root validation.
+    StateRootMismatch,
+    /// Corrupt the receipts root and recompute the block hash, forcing receipts-root validation.
+    ReceiptsRootMismatch,
 }
 
 impl<Engine> ProduceInvalidBlocks<Engine> {
     /// Create a new `ProduceInvalidBlocks` action
     pub fn new(num_blocks: u64, invalid_indices: HashSet<u64>) -> Self {
-        Self { num_blocks, invalid_indices, _phantom: Default::default() }
+        Self {
+            num_blocks,
+            invalid_indices,
+            corruption: InvalidBlockCorruption::Generic,
+            _phantom: Default::default(),
+        }
     }
 
     /// Create a new `ProduceInvalidBlocks` action with a single invalid block at the specified
@@ -1052,6 +1072,20 @@ impl<Engine> ProduceInvalidBlocks<Engine> {
         let mut invalid_indices = HashSet::new();
         invalid_indices.insert(invalid_index);
         Self::new(num_blocks, invalid_indices)
+    }
+
+    /// Create a new `ProduceInvalidBlocks` action that forces state-root validation.
+    pub fn with_state_root_mismatch_at(num_blocks: u64, invalid_index: u64) -> Self {
+        let mut this = Self::with_invalid_at(num_blocks, invalid_index);
+        this.corruption = InvalidBlockCorruption::StateRootMismatch;
+        this
+    }
+
+    /// Create a new `ProduceInvalidBlocks` action that forces receipts-root validation.
+    pub fn with_receipts_root_mismatch_at(num_blocks: u64, invalid_index: u64) -> Self {
+        let mut this = Self::with_invalid_at(num_blocks, invalid_index);
+        this.corruption = InvalidBlockCorruption::ReceiptsRootMismatch;
+        this
     }
 }
 
@@ -1086,20 +1120,45 @@ where
                     let envelope_v3: ExecutionPayloadEnvelopeV3 = latest_envelope.clone().into();
                     let mut corrupted_payload = envelope_v3.execution_payload;
 
-                    // corrupt the state root to make the block invalid
-                    corrupted_payload.payload_inner.payload_inner.state_root = B256::random();
+                    match self.corruption {
+                        InvalidBlockCorruption::Generic |
+                        InvalidBlockCorruption::StateRootMismatch => {
+                            corrupted_payload.payload_inner.payload_inner.state_root =
+                                B256::random();
+                        }
+                        InvalidBlockCorruption::ReceiptsRootMismatch => {
+                            corrupted_payload.payload_inner.payload_inner.receipts_root =
+                                B256::random();
+                        }
+                    }
+
+                    let versioned_hashes = Vec::new();
+                    let parent_beacon_block_root = B256::random();
+
+                    if !matches!(self.corruption, InvalidBlockCorruption::Generic) {
+                        // engine_newPayloadV3 passes the parent beacon block root outside the
+                        // payload, but the validator inserts it into the header before hashing.
+                        let sidecar = ExecutionPayloadSidecar::v3(CancunPayloadFields {
+                            parent_beacon_block_root,
+                            versioned_hashes: versioned_hashes.clone(),
+                        });
+                        corrupted_payload.payload_inner.payload_inner.block_hash =
+                            ExecutionPayload::V3(corrupted_payload.clone())
+                                .try_into_block_with_sidecar::<TransactionSigned>(&sidecar)?
+                                .hash_slow();
+                    }
 
                     debug!(
-                        "Corrupted state root for block {} to: {}",
-                        block_index, corrupted_payload.payload_inner.payload_inner.state_root
+                        "Corrupted payload for block {} with {:?}: state_root={}, receipts_root={}, block_hash={}",
+                        block_index,
+                        self.corruption,
+                        corrupted_payload.payload_inner.payload_inner.state_root,
+                        corrupted_payload.payload_inner.payload_inner.receipts_root,
+                        corrupted_payload.payload_inner.payload_inner.block_hash
                     );
 
                     // send the corrupted payload via newPayload
                     let engine_client = env.node_clients[0].engine.http_client();
-                    // for simplicity, we'll use empty versioned hashes for invalid block testing
-                    let versioned_hashes = Vec::new();
-                    // use a random parent beacon block root since this is for invalid block testing
-                    let parent_beacon_block_root = B256::random();
 
                     let new_payload_response = EngineApiClient::<Engine>::new_payload_v3(
                         &engine_client,
@@ -1112,6 +1171,40 @@ where
                     // expect the payload to be rejected as invalid
                     match new_payload_response.status {
                         PayloadStatusEnum::Invalid { validation_error } => {
+                            match self.corruption {
+                                InvalidBlockCorruption::Generic => {}
+                                InvalidBlockCorruption::StateRootMismatch => {
+                                    if validation_error.contains("block hash mismatch") {
+                                        return Err(eyre::eyre!(
+                                            "Expected state-root validation error, got early block hash mismatch: {:?}",
+                                            validation_error
+                                        ));
+                                    }
+                                    if !validation_error.contains("state root") &&
+                                        !validation_error.contains("state_root")
+                                    {
+                                        return Err(eyre::eyre!(
+                                            "Expected state-root validation error, got: {:?}",
+                                            validation_error
+                                        ));
+                                    }
+                                }
+                                InvalidBlockCorruption::ReceiptsRootMismatch => {
+                                    if validation_error.contains("block hash mismatch") {
+                                        return Err(eyre::eyre!(
+                                            "Expected receipts-root validation error, got early block hash mismatch: {:?}",
+                                            validation_error
+                                        ));
+                                    }
+                                    if !validation_error.contains("receipt") {
+                                        return Err(eyre::eyre!(
+                                            "Expected receipts-root validation error, got: {:?}",
+                                            validation_error
+                                        ));
+                                    }
+                                }
+                            }
+
                             debug!(
                                 "Block {} correctly rejected as invalid: {:?}",
                                 block_index, validation_error
