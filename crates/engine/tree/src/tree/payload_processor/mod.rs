@@ -1010,13 +1010,14 @@ mod tests {
     use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
     use reth_evm::OnStateHook;
     use reth_evm_ethereum::EthEvmConfig;
+    use reth_execution_cache::CachedStatus;
     use reth_primitives_traits::{Account, Recovered, StorageEntry};
     use reth_provider::{
         providers::{BlockchainProvider, OverlayBuilder, OverlayStateProviderFactory},
         test_utils::create_test_provider_factory_with_chain_spec,
         ChainSpecProvider, HashingWriter,
     };
-    use reth_revm::db::BundleState;
+    use reth_revm::db::{AccountStatus as BundleAccountStatus, BundleAccount, BundleState};
     use reth_testing_utils::generators;
     use reth_trie::{test_utils::state_root, HashedPostState};
     use reth_trie_db::ChangesetCache;
@@ -1167,6 +1168,71 @@ mod tests {
         // Cache for block 3 should not exist
         let cached3 = payload_processor.execution_cache.get_cache_for(block3_hash);
         assert!(cached3.is_none(), "New block cache should not be created on mismatch");
+    }
+
+    #[test]
+    fn on_inserted_executed_block_mutates_checked_out_parent_cache_repro() {
+        let payload_processor = PayloadProcessor::new(
+            reth_tasks::Runtime::test(),
+            EthEvmConfig::new(Arc::new(ChainSpec::default())),
+            &TreeConfig::default(),
+            PrecompileCacheMap::default(),
+        );
+
+        let parent_hash = B256::from([1u8; 32]);
+        payload_processor
+            .execution_cache
+            .update_with_guard(|slot| *slot = Some(make_saved_cache(parent_hash)));
+
+        let checked_out = payload_processor
+            .execution_cache
+            .get_cache_for(parent_hash)
+            .expect("expected parent cache checkout to succeed");
+
+        let polluted_address = Address::random();
+        let local_account = AccountInfo {
+            balance: U256::from(1337),
+            nonce: 7,
+            code_hash: KECCAK_EMPTY,
+            code: None,
+            account_id: None,
+        };
+        let local_bundle_state = BundleState {
+            state: HashMap::from_iter([(
+                polluted_address,
+                BundleAccount::new(
+                    None,
+                    Some(local_account),
+                    Default::default(),
+                    BundleAccountStatus::Changed,
+                ),
+            )]),
+            contracts: Default::default(),
+            reverts: Default::default(),
+            state_size: 1,
+            reverts_size: 0,
+        };
+
+        let local_block = BlockWithParent {
+            block: BlockNumHash { hash: B256::from([2u8; 32]), number: 2 },
+            parent: parent_hash,
+        };
+
+        payload_processor.on_inserted_executed_block(local_block, &local_bundle_state);
+
+        let account = checked_out
+            .cache()
+            .get_or_try_insert_account_with(polluted_address, || Ok::<_, ()>(None))
+            .expect("cache read should succeed");
+
+        assert!(
+            matches!(
+                account,
+                CachedStatus::Cached(Some(account))
+                    if account.nonce == 7 && account.balance == U256::from(1337)
+            ),
+            "checked-out parent cache should observe the inserted local block mutation"
+        );
     }
 
     fn create_mock_state_updates(num_accounts: usize, updates_per_account: usize) -> Vec<EvmState> {
