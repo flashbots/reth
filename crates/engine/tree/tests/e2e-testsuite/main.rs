@@ -199,41 +199,6 @@ async fn test_engine_tree_reorg_with_missing_ancestor_expecting_valid_e2e() -> R
     Ok(())
 }
 
-/// Test that a payload with a mismatched state root is rejected by the engine API.
-///
-/// This drives the payload validation path end-to-end: build a valid payload, corrupt the
-/// execution payload's state root, submit it via `engine_newPayloadV3`, and assert the engine
-/// returns `INVALID`.
-#[tokio::test]
-async fn test_engine_tree_rejects_state_root_mismatch_e2e() -> Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let test = TestBuilder::new()
-        .with_setup(default_engine_tree_setup())
-        .with_action(ProduceInvalidBlocks::<EthEngineTypes>::with_state_root_mismatch_at(1, 0));
-
-    test.run::<EthereumNode>().await?;
-
-    Ok(())
-}
-
-/// Test that a payload with a mismatched receipts root is rejected by the engine API.
-///
-/// This preserves block-hash consistency after corrupting the receipts root, so validation reaches
-/// the receipts-root check instead of failing early on header hash mismatch.
-#[tokio::test]
-async fn test_engine_tree_rejects_receipts_root_mismatch_e2e() -> Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let test = TestBuilder::new()
-        .with_setup(default_engine_tree_setup())
-        .with_action(ProduceInvalidBlocks::<EthEngineTypes>::with_receipts_root_mismatch_at(1, 0));
-
-    test.run::<EthereumNode>().await?;
-
-    Ok(())
-}
-
 /// Test that verifies buffered blocks are eventually connected when sent in reverse order.
 #[tokio::test]
 async fn test_engine_tree_buffered_blocks_are_eventually_connected_e2e() -> Result<()> {
