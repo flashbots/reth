@@ -1000,7 +1000,8 @@ mod tests {
     use crate::tree::{
         payload_processor::{evm_state_to_hashed_post_state, ExecutionEnv, PayloadProcessor},
         precompile_cache::PrecompileCacheMap,
-        ExecutionCache, PayloadExecutionCache, SavedCache, StateProviderBuilder, TreeConfig,
+        CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider, ExecutionCache,
+        PayloadExecutionCache, SavedCache, StateProviderBuilder, TreeConfig,
     };
     use alloy_eips::eip1898::{BlockNumHash, BlockWithParent};
     use alloy_evm::block::StateChangeSource;
@@ -1014,8 +1015,8 @@ mod tests {
     use reth_primitives_traits::{Account, Recovered, StorageEntry};
     use reth_provider::{
         providers::{BlockchainProvider, OverlayBuilder, OverlayStateProviderFactory},
-        test_utils::create_test_provider_factory_with_chain_spec,
-        ChainSpecProvider, HashingWriter,
+        test_utils::{create_test_provider_factory_with_chain_spec, MockEthProvider},
+        AccountReader, ChainSpecProvider, HashingWriter,
     };
     use reth_revm::db::{AccountStatus as BundleAccountStatus, BundleAccount, BundleState};
     use reth_testing_utils::generators;
@@ -1233,6 +1234,71 @@ mod tests {
             ),
             "checked-out parent cache should observe the inserted local block mutation"
         );
+    }
+
+    #[test]
+    fn payload_validation_cached_state_provider_observes_inserted_block_mutation_repro() {
+        let payload_processor = PayloadProcessor::new(
+            reth_tasks::Runtime::test(),
+            EthEvmConfig::new(Arc::new(ChainSpec::default())),
+            &TreeConfig::default(),
+            PrecompileCacheMap::default(),
+        );
+
+        let parent_hash = B256::from([1u8; 32]);
+        payload_processor
+            .execution_cache
+            .update_with_guard(|slot| *slot = Some(make_saved_cache(parent_hash)));
+
+        let checked_out = payload_processor
+            .execution_cache
+            .get_cache_for(parent_hash)
+            .expect("expected parent cache checkout to succeed");
+
+        let cached_state_provider = CachedStateProvider::new(
+            MockEthProvider::default(),
+            checked_out.cache().clone(),
+            CachedStateMetrics::zeroed(CachedStateMetricsSource::Test),
+        );
+
+        let polluted_address = Address::random();
+        let local_account = AccountInfo {
+            balance: U256::from(1337),
+            nonce: 7,
+            code_hash: KECCAK_EMPTY,
+            code: None,
+            account_id: None,
+        };
+        let local_bundle_state = BundleState {
+            state: HashMap::from_iter([(
+                polluted_address,
+                BundleAccount::new(
+                    None,
+                    Some(local_account),
+                    Default::default(),
+                    BundleAccountStatus::Changed,
+                ),
+            )]),
+            contracts: Default::default(),
+            reverts: Default::default(),
+            state_size: 1,
+            reverts_size: 0,
+        };
+
+        let local_block = BlockWithParent {
+            block: BlockNumHash { hash: B256::from([2u8; 32]), number: 2 },
+            parent: parent_hash,
+        };
+
+        payload_processor.on_inserted_executed_block(local_block, &local_bundle_state);
+
+        let account = cached_state_provider
+            .basic_account(&polluted_address)
+            .expect("provider read should succeed")
+            .expect("inserted local account should be read from cache");
+
+        assert_eq!(account.nonce, 7);
+        assert_eq!(account.balance, U256::from(1337));
     }
 
     fn create_mock_state_updates(num_accounts: usize, updates_per_account: usize) -> Vec<EvmState> {
