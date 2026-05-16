@@ -44,6 +44,20 @@ use std::{
 };
 use tracing::{debug, debug_span, instrument, trace, warn, Span};
 
+#[cfg(test)]
+static TEST_INSERT_EXECUTED_ON_CACHE_CHECKOUT: std::sync::Mutex<
+    Option<(BlockWithParent, BundleState)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_test_insert_executed_on_cache_checkout(
+    block_with_parent: BlockWithParent,
+    bundle_state: BundleState,
+) {
+    *TEST_INSERT_EXECUTED_ON_CACHE_CHECKOUT.lock().unwrap() =
+        Some((block_with_parent, bundle_state));
+}
+
 pub mod bal;
 pub mod multiproof;
 mod preserved_sparse_trie;
@@ -561,6 +575,12 @@ where
     pub fn cache_for(&self, parent_hash: B256) -> SavedCache {
         if let Some(cache) = self.execution_cache.get_cache_for(parent_hash) {
             debug!("reusing execution cache");
+            #[cfg(test)]
+            if let Some((block_with_parent, bundle_state)) =
+                TEST_INSERT_EXECUTED_ON_CACHE_CHECKOUT.lock().unwrap().take()
+            {
+                self.on_inserted_executed_block(block_with_parent, &bundle_state);
+            }
             cache
         } else {
             debug!("creating new execution cache on cache miss");
@@ -1299,6 +1319,88 @@ mod tests {
 
         assert_eq!(account.nonce, 7);
         assert_eq!(account.balance, U256::from(1337));
+    }
+
+    #[test]
+    fn same_parent_sibling_insert_can_create_state_root_mismatch_repro() {
+        let payload_processor = PayloadProcessor::new(
+            reth_tasks::Runtime::test(),
+            EthEvmConfig::new(Arc::new(ChainSpec::default())),
+            &TreeConfig::default(),
+            PrecompileCacheMap::default(),
+        );
+
+        let parent_hash = B256::from([1u8; 32]);
+        payload_processor
+            .execution_cache
+            .update_with_guard(|slot| *slot = Some(make_saved_cache(parent_hash)));
+
+        // This models validation of consensus sibling C checking out parent P's cache.
+        let checked_out = payload_processor
+            .execution_cache
+            .get_cache_for(parent_hash)
+            .expect("expected parent cache checkout to succeed");
+
+        let cached_state_provider = CachedStateProvider::new(
+            MockEthProvider::default(),
+            checked_out.cache().clone(),
+            CachedStateMetrics::zeroed(CachedStateMetricsSource::Test),
+        );
+
+        let polluted_address = Address::random();
+        let sibling_account = AccountInfo {
+            balance: U256::from(1337),
+            nonce: 7,
+            code_hash: KECCAK_EMPTY,
+            code: None,
+            account_id: None,
+        };
+        let sibling_bundle_state = BundleState {
+            state: HashMap::from_iter([(
+                polluted_address,
+                BundleAccount::new(
+                    None,
+                    Some(sibling_account),
+                    Default::default(),
+                    BundleAccountStatus::Changed,
+                ),
+            )]),
+            contracts: Default::default(),
+            reverts: Default::default(),
+            state_size: 1,
+            reverts_size: 0,
+        };
+
+        // This models local sibling L being inserted while C still validates from parent P.
+        let local_sibling = BlockWithParent {
+            block: BlockNumHash { hash: B256::from([2u8; 32]), number: 2 },
+            parent: parent_hash,
+        };
+        payload_processor.on_inserted_executed_block(local_sibling, &sibling_bundle_state);
+
+        let account = cached_state_provider
+            .basic_account(&polluted_address)
+            .expect("provider read should succeed")
+            .expect("inserted sibling account should be read from the checked-out parent cache");
+
+        let expected_state_root =
+            state_root(std::iter::empty::<(Address, (Account, HashMap<B256, U256>))>());
+        let polluted_state_root = state_root([(
+            polluted_address,
+            (
+                Account {
+                    nonce: account.nonce,
+                    balance: account.balance,
+                    bytecode_hash: account.bytecode_hash,
+                },
+                HashMap::<B256, U256>::default(),
+            ),
+        )]);
+
+        assert_ne!(
+            polluted_state_root, expected_state_root,
+            "validation from parent P would compute a different state root after sibling L polluted the checked-out cache"
+        );
     }
 
     fn create_mock_state_updates(num_accounts: usize, updates_per_account: usize) -> Vec<EvmState> {
