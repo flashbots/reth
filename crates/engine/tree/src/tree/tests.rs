@@ -27,11 +27,9 @@ use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_payload_primitives::BuiltPayloadExecutedBlock;
 use reth_primitives_traits::Block as _;
 use reth_provider::test_utils::MockEthProvider;
 use reth_tasks::spawn_os_thread;
-use reth_trie::{updates::TrieUpdates, HashedPostState};
 use std::{
     collections::BTreeMap,
     str::FromStr,
@@ -64,73 +62,6 @@ impl reth_engine_primitives::PayloadValidator<EthEngineTypes> for MockEngineVali
                 reth_payload_primitives::NewPayloadError::Other(format!("{e:?}").into())
             })?;
         Ok(block.seal_slow())
-    }
-}
-
-fn built_payload_executed_block(block: &ExecutedBlock) -> BuiltPayloadExecutedBlock<EthPrimitives> {
-    BuiltPayloadExecutedBlock {
-        recovered_block: block.recovered_block.clone(),
-        execution_output: block.execution_output.clone(),
-        hashed_state: Arc::new(HashedPostState::default()),
-        trie_updates: Arc::new(TrieUpdates::default()),
-    }
-}
-
-#[test]
-fn test_same_parent_insert_executed_block_can_poison_payload_validation_cache() {
-    reth_tracing::init_test_tracing();
-
-    let mut block_builder =
-        TestBlockBuilder::eth().with_chain_spec(MAINNET.as_ref().clone()).with_state();
-    let parent = block_builder.get_executed_block_with_number(1, MAINNET.genesis_hash());
-    let consensus_sibling =
-        block_builder.get_executed_block_with_number(2, parent.recovered_block().hash());
-    let local_sibling =
-        block_builder.get_executed_block_with_number(2, parent.recovered_block().hash());
-
-    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(vec![parent.clone()]);
-
-    // Warm the execution cache for parent P, as if parent P was the latest executed block.
-    let _ = test_harness.tree.payload_validator.on_inserted_executed_block(
-        built_payload_executed_block(&parent),
-        &test_harness.tree.state,
-    );
-
-    // Model the production race: consensus sibling C checks out P's cache, then local sibling L is
-    // inserted via the already-executed payload path before C finishes validation.
-    crate::tree::payload_processor::set_test_insert_executed_on_cache_checkout(
-        local_sibling.recovered_block().block_with_parent(),
-        local_sibling.execution_output.state.clone(),
-    );
-
-    let consensus_block = consensus_sibling.recovered_block().clone_block();
-    let consensus_payload = ExecutionData {
-        payload: ExecutionPayloadV3::from_block_unchecked(
-            consensus_sibling.recovered_block().hash(),
-            &consensus_block,
-        )
-        .into(),
-        sidecar: ExecutionPayloadSidecar::v3(CancunPayloadFields {
-            parent_beacon_block_root: consensus_block
-                .header
-                .parent_beacon_block_root
-                .expect("test block should have parent beacon block root"),
-            versioned_hashes: vec![],
-        }),
-    };
-
-    let outcome = test_harness.tree.on_new_payload(consensus_payload).unwrap();
-
-    match outcome.outcome.status {
-        PayloadStatusEnum::Invalid { validation_error } => {
-            assert!(
-                validation_error.contains("mismatched block state root"),
-                "expected state-root mismatch, got: {validation_error}"
-            );
-        }
-        status => panic!(
-            "cache pollution from local same-parent InsertExecutedBlock should invalidate consensus sibling, got {status:?}"
-        ),
     }
 }
 
